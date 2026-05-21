@@ -1,0 +1,105 @@
+name: Release
+
+# Manually triggered ("Run workflow"). Builds a self-contained bundle for each
+# platform on its own runner (no cross-compile), publishes a GitHub Release with
+# all archives, and publishes the npm thin-installer (shim + per-platform
+# packages). Bump package.json + finalize the CHANGELOG before triggering.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (default: package.json version)"
+        required: false
+        type: string
+      publish_npm:
+        description: "Publish to npm"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write   # create the GitHub Release + tag
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: darwin-arm64, os: macos-14 }
+          - { target: darwin-x64,   os: macos-13 }
+          - { target: linux-x64,    os: ubuntu-latest }
+          - { target: linux-arm64,  os: ubuntu-24.04-arm }
+          # Windows (win32-x64 / win32-arm64): TODO — build-bundle.sh is unix-only.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - name: Build bundle
+        run: bash scripts/build-bundle.sh ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.target }}
+          path: release/codegraph-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+
+      - name: Resolve version
+        id: ver
+        run: |
+          V="${{ inputs.version }}"
+          [ -n "$V" ] || V="$(node -p "require('./package.json').version")"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Collect bundles
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: bundle-*
+          merge-multiple: true
+      - run: mkdir -p release && cp artifacts/*.tar.gz release/ && ls -lh release
+
+      - name: Release notes
+        id: notes
+        run: |
+          if node scripts/extract-release-notes.mjs "${{ steps.ver.outputs.version }}" > /tmp/notes.md 2>/dev/null && [ -s /tmp/notes.md ]; then
+            echo "file=/tmp/notes.md" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ steps.ver.outputs.version }}"
+          if [ -n "${{ steps.notes.outputs.file }}" ]; then
+            gh release create "$TAG" release/*.tar.gz --title "$TAG" --notes-file "${{ steps.notes.outputs.file }}"
+          else
+            gh release create "$TAG" release/*.tar.gz --title "$TAG" --generate-notes
+          fi
+
+      - name: Publish to npm
+        if: ${{ inputs.publish_npm }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          bash scripts/pack-npm.sh "${{ steps.ver.outputs.version }}"
+          # Platform packages first, then the main shim (which depends on them).
+          for dir in release/npm/codegraph-* release/npm/main; do
+            echo "publishing $dir"
+            ( cd "$dir" && npm publish --access public )
+          done
