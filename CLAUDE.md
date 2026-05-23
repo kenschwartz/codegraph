@@ -90,6 +90,56 @@ Cursor launches MCP subprocesses with the wrong cwd and doesn't pass `rootUri` i
 
 `src/mcp/server-instructions.ts` is sent back to the agent in the MCP `initialize` response. This is the *first* thing every agent sees about how to use the tools — treat it as the authoritative tool guidance and keep it in sync with `instructions-template.ts` and `.cursor/rules/codegraph.mdc`.
 
+## Retrieval performance & dynamic-dispatch coverage (do not regress)
+
+CodeGraph's core value is letting an agent answer **structural/flow** questions ("how does X reach Y", trace, impact, callers) with a few **fast** codegraph calls and **zero Read/Grep**. The optimization target is **wall-clock latency + tool-call count** — *not* token cost (cost stays ~flat; codegraph calls trade for reads). The mechanism that drives everything here: **an agent falls back to Read/Grep the instant a codegraph answer is insufficient.** So every change is judged by one question — is codegraph's answer sufficient enough to *stop* the agent from reading?
+
+**Target behavior:** a flow question resolves in **1 codegraph call on small repos, scaling to 3–5 on large**, with **Read/Grep = 0**. When reviewing a PR or trying something new, do not regress this.
+
+### Explore budget — keep BOTH budgets monotonic with repo size
+
+Two functions in `src/mcp/tools.ts` scale explore with indexed file count. This is the expected resolution (a regression here silently forces agents back to Read):
+
+| Repo | files | explore calls | chars/call | per-file |
+|---|---|---|---|---|
+| express (small) | 147 | 1 | 18K | 3800 |
+| excalidraw/django (medium) | 643–3043 | 2 | 28K | 6500 |
+| vscode (large) | 10446 | 3 | 35K | 7000 |
+| ~20k / ~40k | — | 4 / 5 | 38K | 7000 |
+
+- `getExploreBudget(fileCount)` → **call** budget: `<500→1, <5000→2, <15000→3, <25000→4, ≥25000→5` (max 5).
+- `getExploreOutputBudget(fileCount)` → **per-call** output (chars / files / per-file). **Invariant: a larger tier must never get a smaller `maxCharsPerFile` than a smaller tier.** (Regression that motivated this doc: the `<5000` tier's 2500 was *below* the `<500` tier's 3800, so on a god-file repo — excalidraw's 415 KB `App.tsx` — one explore returned <1% of the file and forced a Read.)
+- Explore output must **never tell the agent to "use Read"** — steer to another `codegraph_explore` and "treat returned source as already Read."
+
+### Dynamic-dispatch coverage — the flow must EXIST in the graph end-to-end
+
+Static tree-sitter extraction misses computed/indirect calls, so flows break at dynamic dispatch and the agent reads to reconstruct them. Synthesizers/resolvers bridge these so `trace`/`explore` connect end-to-end (`src/resolution/callback-synthesizer.ts`, `src/resolution/frameworks/`). Channels today: callback/observer, EventEmitter, **React re-render** (`setState`→`render`), **JSX child** (`render`→child component), django ORM descriptor. All synthesized edges are `provenance:'heuristic'` with `metadata.synthesizedBy` + `registeredAt` (the wiring site), surfaced inline in `trace`, the `node` trail, and `context` call-paths.
+
+**Principle: partial coverage is WORSE than none.** Bridging one boundary but not the next reveals a hop the agent then drills + reads to finish. Measured on excalidraw: react-render alone *raised* reads to 5–7; only completing the flow (adding the jsx-child hop) dropped it to 0–1. **Always close the flow end-to-end and re-measure** — never ship a half-bridged flow.
+
+### Validation methodology (REQUIRED for every new language/framework)
+
+For each **language × framework**, validate on **small, medium, and large** real repos with **≥3 different flow prompts** each:
+
+1. **Pick the canonical flow** for the framework ("how does X reach Y": state→render, request→handler→view, query→SQL, action→reducer→store…).
+2. **Deterministic probes** (`scripts/agent-eval/probe-{trace,node,context,explore}.mjs` against the built `dist/`): `trace(from,to)` connects end-to-end with no break; **no node explosion** (`select count(*) from nodes` stable before/after re-index); synthesized-edge **precision** spot-check (`select … where provenance='heuristic'`).
+3. **Agent A/B** (`scripts/agent-eval/run-all.sh <repo> "<Q>"`): with vs without codegraph, **≥2 runs/arm** (run-to-run variance is large — never conclude from n=1). Record **duration, total tool calls, Read, Grep**. Optional forced-Read-0 sufficiency proof via the block-read hook (`scripts/agent-eval/hook-settings.json`).
+4. **Pass bar:** a normal flow question reaches **~0 Read/Grep within the repo's explore-call budget**, runs **faster** than without-codegraph, and shows **no regression on a control repo**. Record the numbers in `docs/design/dynamic-dispatch-coverage-playbook.md` (the coverage matrix).
+
+Full playbook + per-mechanism design: `docs/design/dynamic-dispatch-coverage-playbook.md` and `docs/design/callback-edge-synthesis.md`.
+
+### Worked example — Excalidraw (TS/React, medium, 643 files)
+
+The template to replicate per language/framework. Question: *"how does updating an element re-render the canvas on screen?"* (the full flow crosses three React boundaries: observer callback, `setState`→`render`, and JSX child).
+
+| Stage | duration | Read | Grep | codegraph |
+|---|---|---|---|---|
+| Without codegraph | 115–139s | 9–10 | 10–11 | 0 |
+| Broken (explore-budget regression) | 131–139s | 5–10 | 3–5 | 6–14 |
+| Fixed (budget + msgs + full synthesis) | **64–76s** | **0–1** | 2 | **3–4** |
+
+Validated: `trace(mutateElement, renderStaticScene)` connects in **6 hops** across all three boundaries (`mutateElement → triggerUpdate → [callback] triggerRender → [react-render] render → [jsx] StaticCanvas → renderStaticScene`), each hop showing inline source + the wiring site; node count stable at 9,289; 1 callback + 46 react-render + 280 jsx-render synthesized edges (no explosion, precision-checked).
+
 ## Tests
 
 Tests live in `__tests__/` and mirror the module they cover. Notable ones beyond the obvious:
