@@ -25,6 +25,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `codegraph_explore`/`codegraph_node`/Read. Measured across real repos: fewer
   tool calls and lower cost than the prior path-only output, with no wall-clock
   regression.
+- **`codegraph_node` and `codegraph_trace` now emit line-numbered source**
+  (`cat -n` style, matching `codegraph_explore` and Read), so an agent can cite
+  or edit exact lines without re-reading the file just to recover line numbers.
 
 ## [0.9.4] - 2026-05-22
 

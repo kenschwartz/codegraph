@@ -1241,7 +1241,7 @@ export class ToolHandler {
     if (slice.length > maxLines) { omitted = slice.length - maxLines; slice = slice.slice(0, maxLines); }
     const nonBlank = slice.filter(l => l.trim().length > 0);
     const dedent = nonBlank.length ? Math.min(...nonBlank.map(l => l.length - l.trimStart().length)) : 0;
-    let text = slice.map(l => `      ${l.slice(dedent)}`).join('\n');
+    let text = slice.map((l, i) => `      ${startLine + i}\t${l.slice(dedent)}`).join('\n');
     if (text.length > maxChars) {
       text = text.slice(0, maxChars).replace(/\n[^\n]*$/, '');
       omitted = Math.max(omitted, 1);
@@ -2340,7 +2340,10 @@ export class ToolHandler {
       lines.push('', outline, '',
         `> Structural outline only. Read \`${node.filePath}\` or call codegraph_node on a specific member for its body.`);
     } else if (code) {
-      lines.push('', '```' + node.language, code, '```');
+      // Line-numbered (cat -n style, like codegraph_explore and Read) so the
+      // agent can cite/edit exact lines without re-Reading the file for them.
+      const numbered = node.startLine ? numberSourceLines(code, node.startLine) : code;
+      lines.push('', '```' + node.language, numbered, '```');
     }
 
     return lines.join('\n');
