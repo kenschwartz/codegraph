@@ -1183,6 +1183,13 @@ export class ToolHandler {
         registeredAt,
       };
     }
+    if (m?.synthesizedBy === 'interface-impl') {
+      return {
+        label: `interface/abstract dispatch — runs the implementation override (dynamic dispatch)`,
+        compact: `dynamic: interface → impl${at}`,
+        registeredAt,
+      };
+    }
     return null;
   }
 

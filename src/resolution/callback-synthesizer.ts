@@ -327,6 +327,66 @@ function cppOverrideEdges(queries: QueryBuilder): Edge[] {
 }
 
 /**
+ * Phase 5.5: interface / abstract dispatch (Java, Kotlin). A call through an
+ * injected interface (`@Autowired FooService svc; svc.list()`) or an abstract
+ * base dispatches at runtime to the implementing class's override — a vtable
+ * indirection with no static call edge — so a request→service flow stops at the
+ * interface method. Bridge it like cpp-override: for each class that
+ * `implements` an interface (or `extends` an abstract base), link each
+ * base/interface method → the class's same-name method (the override) so
+ * trace/callees reach the implementation. Over-approximation accepted
+ * (reachability-correct); capped per class, gated to JVM languages.
+ */
+const IFACE_OVERRIDE_LANGS = new Set(['java', 'kotlin']);
+function interfaceOverrideEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  const methodsOf = (classId: string): Node[] =>
+    queries
+      .getOutgoingEdges(classId, ['contains'])
+      .map((e) => queries.getNodeById(e.target))
+      .filter((n): n is Node => !!n && n.kind === 'method');
+  for (const cls of queries.getNodesByKind('class')) {
+    const implMethods = methodsOf(cls.id).filter((n) => IFACE_OVERRIDE_LANGS.has(n.language));
+    if (implMethods.length === 0) continue;
+    for (const sup of queries.getOutgoingEdges(cls.id, ['implements', 'extends'])) {
+      const base = queries.getNodeById(sup.target);
+      if (!base || !IFACE_OVERRIDE_LANGS.has(base.language) || base.id === cls.id) continue;
+      // Group impl methods by name to handle OVERLOADS: an interface `list()` and
+      // `list(params)` are distinct nodes and a call may resolve to either, so
+      // link every base overload → every same-name impl overload (keying by name
+      // alone would drop all but one and miss the resolved overload).
+      const implByName = new Map<string, Node[]>();
+      for (const m of implMethods) {
+        const arr = implByName.get(m.name);
+        if (arr) arr.push(m); else implByName.set(m.name, [m]);
+      }
+      let added = 0;
+      for (const bm of methodsOf(base.id)) {
+        if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+        for (const m of implByName.get(bm.name) ?? []) {
+          if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+          if (bm.id === m.id) continue;
+          const key = `${bm.id}>${m.id}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          edges.push({
+            source: bm.id,
+            target: m.id,
+            kind: 'calls',
+            line: bm.startLine,
+            provenance: 'heuristic',
+            metadata: { synthesizedBy: 'interface-impl', via: m.name, registeredAt: `${m.filePath}:${m.startLine}` },
+          });
+          added++;
+        }
+      }
+    }
+  }
+  return edges;
+}
+
+/**
  * Phase 5: React JSX child rendering. A component that returns `<Child .../>`
  * mounts Child — React calls it — but JSX instantiation isn't a static call edge,
  * so a render tree (App.render → StaticCanvas → renderStaticScene) breaks at the
@@ -473,10 +533,11 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const vueEdges = vueTemplateEdges(ctx);
   const flutterEdges = flutterBuildEdges(queries, ctx);
   const cppEdges = cppOverrideEdges(queries);
+  const ifaceEdges = interfaceOverrideEdges(queries);
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
-  for (const e of [...fieldEdges, ...emitterEdges, ...renderEdges, ...jsxEdges, ...vueEdges, ...flutterEdges, ...cppEdges]) {
+  for (const e of [...fieldEdges, ...emitterEdges, ...renderEdges, ...jsxEdges, ...vueEdges, ...flutterEdges, ...cppEdges, ...ifaceEdges]) {
     const key = `${e.source}>${e.target}`;
     if (seen.has(key)) continue;
     seen.add(key);

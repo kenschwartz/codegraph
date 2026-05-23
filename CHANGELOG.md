@@ -16,6 +16,14 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the short form, so `trace` and `codegraph_trace` are equivalent. Lets you
   constrain an agent to a minimal surface (or A/B-test tool selection) without
   editing the client's MCP config. Inert by default.
+- **Java/Kotlin interface & abstract dispatch is now traceable.** A call through
+  an injected interface (Spring `@Autowired FooService svc; svc.list()`) or an
+  abstract base previously dead-ended at the interface method — there's no static
+  edge to the implementation — so request→service→impl flows broke at the DI
+  boundary. CodeGraph now synthesizes interface/base-method → implementing-override
+  edges, so `codegraph_trace` and `codegraph_callees` follow the flow into the
+  implementation (e.g. controller → service interface → service impl). JVM-gated,
+  capped per class, overload-aware.
 
 ### Changed
 - **`codegraph_trace` now returns a self-contained flow dossier.** Each hop on
