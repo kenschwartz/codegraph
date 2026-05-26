@@ -363,19 +363,59 @@ otherwise closed but a Fabric flow still breaks.
 
 ---
 
-## 8. Coverage-matrix entries (preview)
-
-These will be filled in by the implementation PRs as each Phase passes its
-§5 bar. Reproduced here so the §6 playbook matrix knows where the rows go:
+## 8. Coverage-matrix entries — measured
 
 | Language | Framework | Canonical flow | Mechanism | Status |
 |---|---|---|---|---|
-| Swift × Objective-C | bridging | Swift call → ObjC selector; ObjC call → @objc Swift method | R | ⬜ Phase 1 |
-| JavaScript × Objective-C/Java/Kotlin | React Native legacy bridge | `NativeModules.<M>.<f>` → `RCT_EXPORT_METHOD` / `@ReactMethod` | R | ⬜ Phase 2 |
+| Swift × Objective-C | bridging | Swift call → ObjC selector; ObjC call → @objc Swift method | R | ✅ Phase 1 (§8a) |
+| JavaScript × Objective-C/Java/Kotlin | React Native legacy bridge | `NativeModules.<M>.<f>` → `RCT_EXPORT_METHOD` / `@ReactMethod` | R | ✅ Phase 2 (§8b) |
+| JavaScript × native | React Native TurboModules | spec interface ↔ impl | R (spec as ground truth) | ✅ partial — name-match path lands (§8b) |
 | Objective-C/Java/Kotlin → JavaScript | React Native event emitters | `[self sendEventWithName:]` → `addListener` | S (cross-lang channel) | ⬜ Phase 3 |
 | JavaScript × Swift/Kotlin | Expo Modules | `requireNativeModule('X').fn(...)` → `Function("fn") { }` | R | ⬜ Phase 4 |
-| JavaScript × native | React Native TurboModules | spec interface ↔ impl | R (spec as ground truth) | ⬜ Phase 5 |
 | JavaScript × native | React Native Fabric views | `<MyView p=v/>` → `RCT_EXPORT_VIEW_PROPERTY` / Codegen view spec | R + JSX | ⬜ Phase 6 (defer) |
+
+### 8a. Phase 1 measurements — Swift ↔ ObjC
+
+| Repo | Source files | Bridge edges (framework-resolved) | Sample edges |
+|---|---|---|---|
+| **Charts** (small) | 269 (205 Swift + 59 ObjC/.h) | 28 objc→swift, 1 swift→objc | `handleOption:forChartView:` → `animate` · `setupPieChartView:` → `setExtraOffsets` · `setDataCount:range:` → `setColor` |
+| **realm-swift** (medium) | 369 (151 Swift + 218 ObjC family) | 36 objc→swift, 1185 swift→objc | `valueForUndefinedKey:` → `get` · `setValue:forUndefinedKey:` → `set` · `promote:on:` → `initialize` |
+| **wikipedia-ios** (large) | 1734 (1234 Swift + 500 ObjC/.h) | 52 objc→swift, 983 swift→objc | real-iOS-app bridging across many feature modules |
+
+All three: in-language baselines unchanged, no node-count explosion,
+`trace` connects canonical flows across the boundary (verified on
+Charts: `trace(handleOption:forChartView:, animate)` surfaces the
+bridge edge directly).
+
+### 8b. Phase 2 + 5 (partial) measurements — React Native bridge
+
+| Repo | Source files | Bridge edges (framework-resolved) | Notes |
+|---|---|---|---|
+| **react-native-svg** (small/medium) | ~700 (93 .mm + 115 .java + 6 .kt + 49 js + 92 ts + 154 tsx) | 9 tsx→java via TurboModule spec | RNSvg's iOS uses TurboModule auto-gen (no `RCT_EXPORT_METHOD`); resolutions land on Java. All 9 precise: `isPointInStroke`, `isPointInFill`, `getTotalLength`, `getPointAtLength`, `getCTM`, `getScreenCTM`, `getBBox`, `toDataURL`. |
+| **AsyncStorage** (small, pure legacy bridge) | ~60 (28 kt + 2 mm + 16 ts + 14 tsx + …) | **8/8 precise** | The canonical legacy bridge test — Kotlin `@ReactMethod` + ObjC `RCT_EXPORT_METHOD`. JS `setItem` → Kotlin `legacy_multiSet`; `getItem` → `legacy_multiGet`; `clear` → `legacy_clear`; etc. |
+| **react-native-firebase** (large) | ~1100 (111 .java + 63 .m + 13 .mm + 239 js + 427 ts + 9 tsx) | 18 after RCTEventEmitter blocklist (was 78 before) | Initial 78 included 60 false positives targeting `addListener:` / `remove:` (every RCTEventEmitter declares them; every JS call to `.addListener(...)` resolved into noise). Blocklist cut to 18, all precise: `httpsCallable:region:emulatorHost:...`, `signInWithProvider`, `configureProvider`, `removeFunctionsStreaming:`. |
+| **react-native-screens** (medium) | 1211 | 0 — empty TurboModule spec, no `RCT_EXPORT_METHOD`, all Fabric/Codegen view-side | RNScreens lives entirely in Phase 6 (Fabric, deferred). The bridge declining to over-match here is the right behavior. |
+
+### 8c. Architectural fix discovered during validation
+
+The resolver's `initialize()` runs at CodeGraph construction — before any
+files are indexed — so framework resolvers whose `detect()` consults
+the indexed file list (UIKit / SwiftUI scanning for imports,
+`swift-objc-bridge` looking for both Swift and ObjC files,
+`react-native-bridge` looking for RN markers) all returned false on that
+initial pass and silently dropped themselves. This affected every
+framework resolver in the codebase that read `context.getAllFiles()` /
+`context.readFile()` rather than scanning the filesystem directly — a
+pre-existing latent bug, not bridge-specific. Fixed: `indexAll()` now
+calls `resolver.initialize()` after extraction completes, so detect()
+runs against the populated index.
+
+### 8d. Bridge-precision blocklists (lessons learned)
+
+| Bridge | Blocked names | Reason |
+|---|---|---|
+| swift-objc | `init`, `description`, `hash`, `isEqual`, `copy`, `count`, `value`, `data`, `string`, `object`, `add`, `remove`, `update`, `load`, `save`, `reload`, `cancel`, `start`, `stop`, `pause`, `resume`, `close`, `open`, `show`, `hide`, `dealloc`, `release`, `retain`, `autorelease`, … | Every NSObject subclass implements these; bridging them to arbitrary project-local ObjC methods produces noise. Regular name-matcher handles them on its own. |
+| react-native | `addListener`, `removeListeners`, `remove`, `invalidate`, `startObserving`, `stopObserving` | Every `RCTEventEmitter` subclass declares these via `RCT_EXPORT_METHOD`. JS callers of `.addListener(...)` / `.remove(...)` go through `NativeEventEmitter` (JS abstraction), not the native bridge directly. |
 
 ---
 
